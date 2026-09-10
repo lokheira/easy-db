@@ -65,6 +65,9 @@ cmd/easydb
 
 ### 阶段 1：磁盘存储与文件格式（1–2 周）
 
+> 📄 **详细实施文档：[`docs/phase-1-storage.md`](docs/phase-1-storage.md)**
+> 含页布局字段表、记录编码、Go 接口签名、分步路线、测试清单、验收命令与学习资源。
+
 **学习点**：页（Page）、页头、slot 目录（堆表经典布局）、定长/变长记录、文件末尾追加页、删除标记与空闲空间回收、持久化。
 
 - `Page`：固定 `[]byte`（4096 字节），提供读写头部字段（页类型、记录数、空闲偏移等）的辅助。
@@ -200,6 +203,7 @@ cmd/easydb
 | 存储与检索、事务 | 《DDIA》(Designing Data-Intensive Applications) 第 3、7 章 |
 | 页 / 日志 / B-tree 工程化范例 | SQLite 架构文档（对照学习，不照抄） |
 | B 树与日志深入 | 《Database Internals》— A. Petrov |
+| **阶段 1 逐项落地（页布局 / 编码 / 测试）** | [`docs/phase-1-storage.md`](docs/phase-1-storage.md)，文末附 B 站视频清单 |
 
 ---
 
