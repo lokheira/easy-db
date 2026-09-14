@@ -33,15 +33,15 @@ func OpenHeapFile(path string) (*HeapFile, error) {
 	return &HeapFile{f, path, 0, []PageID{}}, err
 }
 
-func (h *HeapFile) Close() error // 刷盘 + 关闭；Close 之后任何操作都返回错误
-func (h *HeapFile) Sync() error  // 显式 fsync，崩溃测试用
+// func (h *HeapFile) Close() error // 刷盘 + 关闭；Close 之后任何操作都返回错误
+// func (h *HeapFile) Sync() error  // 显式 fsync，崩溃测试用
 
-func (h *HeapFile) PageCount() uint32
-func (h *HeapFile) ReadPage(id PageID) (*Page, error)
-func (h *HeapFile) WritePage(p *Page) error
+// func (h *HeapFile) PageCount() uint32
+// func (h *HeapFile) ReadPage(id PageID) (*Page, error)
+// func (h *HeapFile) WritePage(p *Page) error
 
-// AllocatePage 优先复用空闲页，否则在文件末尾追加一页。
-func (h *HeapFile) AllocatePage(t PageType) (*Page, error)
+// // AllocatePage 优先复用空闲页，否则在文件末尾追加一页。
+// func (h *HeapFile) AllocatePage(t PageType) (*Page, error)
 
-// FreePage 把页标记为 PageTypeFree 并加入空闲列表。
-func (h *HeapFile) FreePage(id PageID) error
+// // FreePage 把页标记为 PageTypeFree 并加入空闲列表。
+// func (h *HeapFile) FreePage(id PageID) error

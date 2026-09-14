@@ -1,6 +1,10 @@
 package storage
 
-import "encoding/binary"
+import (
+	"easydb/utils"
+	"encoding/binary"
+	"sort"
+)
 
 type PageID uint32
 
@@ -20,29 +24,12 @@ type Page struct {
 
 func NewPage(id PageID, t PageType) *Page {
 	data := [PageSize]byte{}
-	// header := [][]byte{
-	// 	utils.MakeChunk(t),
-	// 	utils.MakeChunk(uint8(1)),
-	// 	utils.MakeChunk(uint16(0)),              // TODO SlotCount
-	// 	utils.MakeChunk(uint16(PageHeaderSize)), // FreeStart
-	// 	utils.MakeChunk(uint16(PageSize)),       // FreeEnd
-	// 	utils.MakeChunk(InvalidPageID),          // NextPageID
-	// 	utils.MakeChunk(id),                     // PageID
-	// 	utils.MakeChunk(uint64(0)),              // LSN
-	// 	utils.MakeChunk(uint32(0)),              // Checksum
-	// 	utils.MakeChunk(uint32(0)),              // Reserved
-	// }
-	// offset := 0
-	// for _, c := range header {
-	// 	n := copy(data[offset:], c)
-	// 	offset += n
-	// }
 	pageHeader := PageHeader{
 		PageType:   t,
 		Flags:      0,
 		SlotCount:  0,
-		FreeStart:  PageHeaderSize,
 		FreeEnd:    PageSize,
+		FressSpace: PageSize - PageHeaderSize,
 		NextPageId: InvalidPageID,
 		PageId:     id,
 		LSN:        0,
@@ -67,13 +54,6 @@ func NewPage(id PageID, t PageType) *Page {
 // 	return binary.LittleEndian.Uint16(p.data[2:4])
 // }
 
-// = FreeEnd - FreeStart
-func (p *Page) FreeSpace() int {
-	freeStart := binary.LittleEndian.Uint16(p.data[4:6])
-	freeEnd := binary.LittleEndian.Uint16(p.data[6:8])
-	return int(freeEnd - freeStart)
-}
-
 // func (p *Page) Dirty() bool {
 // 	return false
 // }
@@ -82,41 +62,64 @@ func (p *Page) FreeSpace() int {
 // --- 记录操作 ---
 // InsertRecord 写入一条记录并返回其 slot 号。
 // 空间不足时返回 ErrPageFull（调用方应换页或先尝试 Compact）。
-func (p *Page) InsertRecord(rec []byte) (slotNo uint16, err error) {
-	size := uint16(len(rec))
-	if size > p.FreeEnd-p.FreeStart {
-		return 0, ErrPageFull
+func (p *Page) InsertRecord(rec []byte) (uint16, error) {
+
+	recordLength := uint16(len(rec))
+	if recordLength > MaxRecordSize {
+		return 0, ErrRecordTooBig
+	}
+
+	// 查找空slot
+	slotNo, err := p.nextBlankSlotNo()
+	if err != nil {
+		// 追加slot
+		if err == ErrSlotNotFound {
+			slotNo = p.SlotCount
+			if recordLength+SlotSize > p.FressSpace {
+				return 0, ErrPageFull
+			}
+			p.SlotCount++
+			p.FressSpace -= SlotSize
+		} else {
+			return 0, err
+		}
+	} else {
+		// 复用slot
+		if recordLength > p.FressSpace {
+			return 0, ErrPageFull
+		}
+	}
+
+	// 连续空余空间不足，压缩
+	if p.FreeEnd-p.SlotCount*SlotSize-PageHeaderSize < recordLength {
+		p.Compact()
 	}
 
 	newSlot := Slot{
-		Offset: p.FreeEnd - size,
-		Length: size,
+		Offset: p.FreeEnd - recordLength,
+		Length: recordLength,
 	}
-	copy(newSlot.sliceFrom(p.data[:]), rec)
-	for i := uint16(0); i < p.SlotCount; i++ {
-		slotStart := PageHeaderSize + i*SlotSize
-		bytes := p.data[slotStart : slotStart+SlotSize]
-		slot := NewSlot([4]byte(bytes))
-		if slot.isDeleted() {
-			copy(p.data[slotStart:], newSlot.toChunk())
-			return i, nil
-		}
-	}
-	copy(p.data[p.FreeStart:], newSlot.toChunk())
-	p.SlotCount++
-	return p.SlotCount, nil
+	// 写入slot
+	p.writeSlot(slotNo, newSlot)
+	// 写入record
+	copy(p.data[newSlot.Offset:], rec)
+	// 更新FreeEnd
+	p.FreeEnd = newSlot.Offset
+	// 更新FreeSpace
+	p.FressSpace -= recordLength
+	return slotNo, nil
 }
 
 // GetRecord 返回记录的副本（切片为拷贝，调用方随意持有）。
 func (p *Page) GetRecord(slotNo uint16) ([]byte, error) {
-	if slotNo > p.SlotCount {
+	if slotNo >= p.SlotCount {
 		return nil, ErrSlotNotFound
 	}
 
-	slotStart := PageHeaderSize + slotNo*SlotSize
-	slotBytes := p.data[slotStart : slotStart+SlotSize]
-	slot := NewSlot([4]byte(slotBytes))
-
+	slot := p.getSlot(slotNo)
+	if slot.isDeleted() {
+		return nil, ErrSlotDeleted
+	}
 	b := make([]byte, slot.Length)
 	copy(b, slot.sliceFrom(p.data[:]))
 	return b, nil
@@ -124,44 +127,191 @@ func (p *Page) GetRecord(slotNo uint16) ([]byte, error) {
 
 // DeleteRecord 把 slot 标记为墓碑，不移动其他记录、不立即回收空间。
 func (p *Page) DeleteRecord(slotNo uint16) error {
-	if slotNo > p.SlotCount {
+	if slotNo >= p.SlotCount {
 		return ErrSlotNotFound
 	}
-
-	newSlot := Slot{0, 0}
-	slotStart := PageHeaderSize + slotNo*SlotSize
-	copy(p.data[slotStart:], newSlot.toChunk())
+	s := p.getSlot(slotNo)
+	if s.isDeleted() {
+		return ErrSlotDeleted
+	}
+	p.writeSlot(slotNo, Slot{Offset: 0, Length: 0})
+	p.FressSpace += s.Length
 	return nil
 }
 
 // UpdateRecord 更新记录：长度不变则原地覆盖，否则删除后重插（slot 号可能变化）。
-func (p *Page) UpdateRecord(slotNo uint16, rec []byte) (newSlot uint16, err error)
+func (p *Page) UpdateRecord(slotNo uint16, rec []byte) (uint16, error) {
+	if slotNo >= p.SlotCount {
+		return 0, ErrSlotNotFound
+	}
+	newRecordLength := uint16(len(rec))
+	if newRecordLength > MaxRecordSize {
+		return 0, ErrRecordTooBig
+	}
+	orignalSlot := p.getSlot(slotNo)
+	if orignalSlot.isDeleted() {
+		return 0, ErrSlotDeleted
+	}
+
+	if orignalSlot.Length == newRecordLength { // 更新长度与原长度相等
+		copy(p.data[orignalSlot.Offset:], rec)
+		return slotNo, nil
+	} else if newRecordLength < orignalSlot.Length { // 更新长度变小
+		// 新record写入
+		copy(p.data[orignalSlot.Offset:], rec)
+		// 新slot信息写入
+		newSlot := Slot{Offset: orignalSlot.Offset, Length: newRecordLength}
+		copy(p.data[slotNo*SlotSize+PageHeaderSize:], newSlot.chunk())
+
+		// 空间碎片
+		forwardOffset := orignalSlot.Length - newRecordLength
+		p.FressSpace += forwardOffset
+		return slotNo, nil
+	} else { // 更新长度变大
+		// 增量大于空闲空间
+		if newRecordLength-orignalSlot.Length > p.FressSpace {
+			return 0, ErrPageFull
+		}
+		// 删除原有记录
+		p.DeleteRecord(slotNo)
+		// 连续空余空间不足，压缩
+		if p.FreeEnd-p.SlotCount*SlotSize-PageHeaderSize < newRecordLength {
+			p.Compact()
+		}
+		newSlot := Slot{
+			Offset: p.FreeEnd - newRecordLength,
+			Length: newRecordLength,
+		}
+		// 写入slot
+		p.writeSlot(slotNo, newSlot)
+		// 写入record
+		copy(p.data[newSlot.Offset:], rec)
+		// 更新FreeEnd
+		p.FreeEnd = newSlot.Offset
+		// 更新FreeSpace
+		p.FressSpace -= newRecordLength
+		return slotNo, nil
+	}
+}
 
 // Compact 碎片整理：把所有存活记录压到页尾，重建 slot 目录。
 // 整理后 slot 号保持不变（墓碑保留），因此 RID 依然有效。
-func (p *Page) Compact()
+func (p *Page) Compact() {
+	// 从后向前清理slot墓碑
+	if p.SlotCount == 0 {
+		return
+	}
+	for i := p.SlotCount - 1; i >= uint16(0); i-- {
+		if p.getSlot(i).isDeleted() {
+			p.SlotCount--
+		} else {
+			break
+		}
+	}
+	// 清理碎片
+	slots := make([]Slot, p.SlotCount)
+	idx := 0
+	for i := uint16(0); i < p.SlotCount; i++ {
+		slots[idx] = *p.getSlot(uint16(i))
+		idx++
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		return slots[i].Offset > slots[j].Offset
+	})
+	tailIndex, runningOffset := uint16(PageSize), uint16(0)
+	// 偏移量记录：[当前偏移，碎片偏移]
+	offsetRecord := make([][]uint16, 0)
+	for i := 0; i < int(p.SlotCount); i++ {
+		slot := slots[i]
+		diff := tailIndex - slot.end()
+		runningOffset += diff
+		if diff != 0 {
+			offsetRecord = append(offsetRecord, []uint16{slot.Offset, runningOffset})
+		}
+		tailIndex = slot.Offset
+		slots[i].Offset -= runningOffset
+	}
+	// 处理偏移
+	for i := 0; i < len(offsetRecord); i++ {
+		var length uint16
+		currRecord := offsetRecord[i]
+		if i == len(offsetRecord)-1 {
+			length = p.FreeEnd - currRecord[0]
+		} else {
+			length = currRecord[0] - offsetRecord[i+1][0]
+		}
+		copy(p.data[currRecord[0]-currRecord[1]:], p.data[currRecord[0]:currRecord[0]+length])
+	}
+	for _, s := range slots {
+		p.writeSlot(s.slotNo, s)
+	}
+	p.FreeEnd -= runningOffset
+}
 
 // Iterate 顺序遍历所有存活记录；fn 返回 false 时提前结束。
-func (p *Page) Iterate(fn func(slotNo uint16, rec []byte) bool)
+func (p *Page) Iterate(fn func(slotNo uint16, rec []byte) bool) {
+	for i := uint16(0); i < p.SlotCount; i++ {
+		s := p.getSlot(i)
+		if s.isDeleted() {
+			continue
+		}
+		if !fn(i, s.sliceFrom(p.data[:])) {
+			return
+		}
+	}
+}
 
 // --- 序列化 ---
-func (p *Page) Bytes() []byte // 返回内部数组的切片，只读使用
+// 返回内部数组的切片，只读使用
+func (p *Page) Bytes() []byte {
+	headerBytes := p.PageHeader.Bytes()
+	copy(p.data[:], headerBytes[:])
+	return p.data[:]
+}
 
+func DecodePage(id PageID, buf []byte) (*Page, error) {
+	// TODO
+	return nil, nil
+}
 func (p *Page) getSlot(slotNo uint16) *Slot {
 	slotStart := PageHeaderSize + slotNo*SlotSize
 	slotBytes := p.data[slotStart : slotStart+SlotSize]
-	return NewSlot([4]byte(slotBytes))
+	s := NewSlot([4]byte(slotBytes))
+	s.slotNo = slotNo
+	return s
 }
 
-func DecodePage(id PageID, buf []byte) (*Page, error)
+// 向指定slot写入信息
+func (p *Page) writeSlot(slotNo uint16, slot Slot) {
+	copy(p.data[PageHeaderSize+slotNo*SlotSize:], slot.chunk())
+}
+
+// 追加slot
+func (p *Page) appendSlot(s Slot) uint16 {
+	slotNo := p.SlotCount
+	p.writeSlot(slotNo, s)
+	p.SlotCount++
+	p.FressSpace -= SlotSize
+	return slotNo
+}
+
+// 遍历查找slot墓碑，返回slotNo
+func (p *Page) nextBlankSlotNo() (uint16, error) {
+	for i := uint16(0); i < p.SlotCount; i++ {
+		if s := p.getSlot(i); s.isDeleted() {
+			return i, nil
+		}
+	}
+	return uint16(0), ErrSlotNotFound
+}
 
 // 32 bytes
 type PageHeader struct {
 	PageType   PageType // 页类型
 	Flags      uint8    // 位标志，bit0 = 页内存在已删除 slot（供整理判断）
 	SlotCount  uint16   // slot 总数，含已删除的墓碑 slot
-	FreeStart  uint16   // 空闲区起始 = 页头 + slot 数组末尾
 	FreeEnd    uint16   // 空闲区结束 = 记录区第一个字节
+	FressSpace uint16   // 空闲空间
 	NextPageId PageID   // 同类型页链表指针；0xFFFFFFFF 表示「无」
 	PageId     PageID   // 本页页号，用于自校验与调试
 	LSN        uint64
@@ -169,8 +319,31 @@ type PageHeader struct {
 	Reserved   uint32 // 补齐到 32，保持 8 字节对齐，恒为 0
 }
 
+func (h *PageHeader) Bytes() [32]byte {
+	byteArr := [][]byte{
+		utils.MakeChunk(h.PageType),
+		utils.MakeChunk(h.Flags),
+		utils.MakeChunk(h.SlotCount),
+		utils.MakeChunk(h.FreeEnd),
+		utils.MakeChunk(h.FressSpace),
+		utils.MakeChunk(h.NextPageId),
+		utils.MakeChunk(h.PageId),
+		utils.MakeChunk(h.LSN),
+		utils.MakeChunk(h.CheckSum),
+		utils.MakeChunk(h.Reserved),
+	}
+	bytes := [32]byte{}
+	index := 0
+	for _, chunk := range byteArr {
+		copy(bytes[index:], chunk)
+		index += len(chunk)
+	}
+	return bytes
+}
+
 // 4 bytes
 type Slot struct {
+	slotNo uint16
 	Offset uint16 // 记录在页内的起始偏移
 	Length uint16 // 记录字节数
 }
@@ -186,7 +359,7 @@ func (s *Slot) isDeleted() bool {
 	return s.Offset == 0 && s.Length == 0
 }
 
-func (s *Slot) toChunk() []byte {
+func (s *Slot) chunk() []byte {
 	b := make([]byte, 4)
 	binary.LittleEndian.PutUint16(b[0:], s.Offset)
 	binary.LittleEndian.PutUint16(b[2:], s.Length)
