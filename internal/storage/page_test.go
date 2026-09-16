@@ -374,7 +374,7 @@ func TestDeleteRecord_MarksTombstoneWithoutMovingOthers(t *testing.T) {
 	p := newTestPage()
 	slots := make([]uint16, 3)
 	for i := range slots {
-		slots[i] = mustInsert(t, p, []byte(fmt.Sprintf("rec-%d", i)))
+		slots[i] = mustInsert(t, p, fmt.Appendf(nil, "rec-%d", i))
 	}
 	freeEndBefore := p.FreeEnd
 	slotCountBefore := p.SlotCount
@@ -667,6 +667,12 @@ func TestCompact_InteriorDeletePreservesSurvivors(t *testing.T) {
 
 	mustNotPanic(t, "中间删除后 Compact", func() { p.Compact() })
 
+	for i := uint16(0); i < 10; i++ {
+		s := p.getSlot(i)
+		// if !s.isDeleted() {
+		t.Log(i, s, string(p.sliceBySlot(s)))
+		// }
+	}
 	for i := 0; i < n; i++ {
 		slotNo := uint16(i)
 		got, err := p.GetRecord(slotNo)
@@ -699,11 +705,11 @@ func TestCompact_ReclaimsSpace(t *testing.T) {
 			t.Fatalf("DeleteRecord(%d) 失败: %v", i, err)
 		}
 	}
-	freeBefore := trueFreeSpace(p)
+	freeBefore := p.freeBlock()
 
 	mustNotPanic(t, "回收碎片 Compact", func() { p.Compact() })
 
-	if freeAfter := trueFreeSpace(p); freeAfter <= freeBefore {
+	if freeAfter := p.freeBlock(); freeAfter <= freeBefore {
 		t.Errorf("Compact 未回收空间: 空闲 %d -> %d", freeBefore, freeAfter)
 	}
 
@@ -719,7 +725,7 @@ func TestCompact_AllDeleted(t *testing.T) {
 	defer guard(t)
 	p := newTestPage()
 	for i := 0; i < 5; i++ {
-		mustInsert(t, p, []byte(fmt.Sprintf("r%d", i)))
+		mustInsert(t, p, fmt.Appendf(nil, "r%d", i))
 	}
 	for i := uint16(0); i < 5; i++ {
 		if err := p.DeleteRecord(i); err != nil {
@@ -752,7 +758,7 @@ func TestCompact_TruncatesTrailingTombstones(t *testing.T) {
 	defer guard(t)
 	p := newTestPage()
 	for i := 0; i < 5; i++ {
-		mustInsert(t, p, []byte(fmt.Sprintf("r%d", i)))
+		mustInsert(t, p, fmt.Appendf(nil, "r%d", i))
 	}
 	if err := p.DeleteRecord(4); err != nil {
 		t.Fatalf("DeleteRecord(4) 失败: %v", err)
@@ -776,7 +782,7 @@ func TestCompact_Idempotent(t *testing.T) {
 	defer guard(t)
 	p := newTestPage()
 	for i := 0; i < 8; i++ {
-		mustInsert(t, p, []byte(fmt.Sprintf("record-%02d", i)))
+		mustInsert(t, p, fmt.Appendf(nil, "record-%02d", i))
 	}
 	if err := p.DeleteRecord(2); err != nil {
 		t.Fatalf("DeleteRecord(2) 失败: %v", err)
@@ -809,7 +815,7 @@ func TestIterate_VisitsLiveRecordsInSlotOrder(t *testing.T) {
 	defer guard(t)
 	p := newTestPage()
 	for i := 0; i < 5; i++ {
-		mustInsert(t, p, []byte(fmt.Sprintf("rec%d", i)))
+		mustInsert(t, p, fmt.Appendf(nil, "rec%d", i))
 	}
 	if err := p.DeleteRecord(1); err != nil {
 		t.Fatalf("DeleteRecord(1) 失败: %v", err)
@@ -841,7 +847,7 @@ func TestIterate_EarlyStop(t *testing.T) {
 	defer guard(t)
 	p := newTestPage()
 	for i := 0; i < 5; i++ {
-		mustInsert(t, p, []byte(fmt.Sprintf("rec%d", i)))
+		mustInsert(t, p, fmt.Appendf(nil, "rec%d", i))
 	}
 
 	count := 0
@@ -868,7 +874,7 @@ func TestIterate_AfterCompact(t *testing.T) {
 	defer guard(t)
 	p := newTestPage()
 	for i := 0; i < 6; i++ {
-		mustInsert(t, p, []byte(fmt.Sprintf("rec%d", i)))
+		mustInsert(t, p, fmt.Appendf(nil, "rec%d", i))
 	}
 	if err := p.DeleteRecord(2); err != nil {
 		t.Fatalf("DeleteRecord(2) 失败: %v", err)

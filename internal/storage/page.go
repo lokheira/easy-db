@@ -91,7 +91,7 @@ func (p *Page) InsertRecord(rec []byte) (uint16, error) {
 	}
 
 	// 连续空余空间不足，压缩
-	if p.FreeEnd-p.SlotCount*SlotSize-PageHeaderSize < recordLength {
+	if p.freeBlock() < recordLength {
 		p.Compact()
 	}
 
@@ -121,7 +121,7 @@ func (p *Page) GetRecord(slotNo uint16) ([]byte, error) {
 		return nil, ErrSlotDeleted
 	}
 	b := make([]byte, slot.Length)
-	copy(b, slot.sliceFrom(p.data[:]))
+	copy(b, p.sliceBySlot(slot))
 	return b, nil
 }
 
@@ -175,7 +175,7 @@ func (p *Page) UpdateRecord(slotNo uint16, rec []byte) (uint16, error) {
 		// 删除原有记录
 		p.DeleteRecord(slotNo)
 		// 连续空余空间不足，压缩
-		if p.FreeEnd-p.SlotCount*SlotSize-PageHeaderSize < newRecordLength {
+		if p.freeBlock() < newRecordLength {
 			p.Compact()
 		}
 		newSlot := Slot{
@@ -201,51 +201,72 @@ func (p *Page) Compact() {
 	if p.SlotCount == 0 {
 		return
 	}
-	for i := p.SlotCount - 1; i >= uint16(0); i-- {
+	for i := p.SlotCount - 1; ; i-- {
 		if p.getSlot(i).isDeleted() {
 			p.SlotCount--
 		} else {
 			break
 		}
+		if i == 0 {
+			break
+		}
+	}
+	if p.SlotCount == 0 {
+		p.FreeEnd = PageSize
+		p.FressSpace = PageSize - PageHeaderSize
+		return
 	}
 	// 清理碎片
 	slots := make([]Slot, p.SlotCount)
 	idx := 0
 	for i := uint16(0); i < p.SlotCount; i++ {
-		slots[idx] = *p.getSlot(uint16(i))
+		s := *p.getSlot(uint16(i))
+		if s.isDeleted() {
+			continue
+		}
+		slots[idx] = s
 		idx++
 	}
+	slots = slots[0:idx]
 	sort.Slice(slots, func(i, j int) bool {
 		return slots[i].Offset > slots[j].Offset
 	})
 	tailIndex, runningOffset := uint16(PageSize), uint16(0)
 	// 偏移量记录：[当前偏移，碎片偏移]
-	offsetRecord := make([][]uint16, 0)
-	for i := 0; i < int(p.SlotCount); i++ {
+	offsetRecord := make([]struct {
+		Slot
+		runningOffset uint16
+	}, 0)
+	for i := 0; i < len(slots); i++ {
 		slot := slots[i]
 		diff := tailIndex - slot.end()
 		runningOffset += diff
 		if diff != 0 {
-			offsetRecord = append(offsetRecord, []uint16{slot.Offset, runningOffset})
+			offsetRecord = append(offsetRecord, struct {
+				Slot
+				runningOffset uint16
+			}{slot, runningOffset})
 		}
 		tailIndex = slot.Offset
-		slots[i].Offset -= runningOffset
+		slots[i].Offset += runningOffset
 	}
 	// 处理偏移
 	for i := 0; i < len(offsetRecord); i++ {
-		var length uint16
+		var fromStart, fromEnd uint16
 		currRecord := offsetRecord[i]
 		if i == len(offsetRecord)-1 {
-			length = p.FreeEnd - currRecord[0]
+			fromStart = p.FreeEnd
+			fromEnd = currRecord.Offset + currRecord.Length
 		} else {
-			length = currRecord[0] - offsetRecord[i+1][0]
+			fromStart = offsetRecord[i+1].end()
+			fromEnd = currRecord.Offset + currRecord.Length
 		}
-		copy(p.data[currRecord[0]-currRecord[1]:], p.data[currRecord[0]:currRecord[0]+length])
+		copy(p.data[fromStart+currRecord.runningOffset:], p.data[fromStart:fromEnd])
 	}
 	for _, s := range slots {
 		p.writeSlot(s.slotNo, s)
 	}
-	p.FreeEnd -= runningOffset
+	p.FreeEnd += runningOffset
 }
 
 // Iterate 顺序遍历所有存活记录；fn 返回 false 时提前结束。
@@ -255,7 +276,7 @@ func (p *Page) Iterate(fn func(slotNo uint16, rec []byte) bool) {
 		if s.isDeleted() {
 			continue
 		}
-		if !fn(i, s.sliceFrom(p.data[:])) {
+		if !fn(i, p.sliceBySlot(s)) {
 			return
 		}
 	}
@@ -305,6 +326,14 @@ func (p *Page) nextBlankSlotNo() (uint16, error) {
 	return uint16(0), ErrSlotNotFound
 }
 
+func (p *Page) sliceBySlot(s *Slot) []byte {
+	return p.data[s.Offset : s.Offset+s.Length]
+}
+
+func (p *Page) freeBlock() uint16 {
+	return p.FreeEnd - p.SlotCount*SlotSize - PageHeaderSize
+}
+
 // 32 bytes
 type PageHeader struct {
 	PageType   PageType // 页类型
@@ -317,6 +346,21 @@ type PageHeader struct {
 	LSN        uint64
 	CheckSum   uint32
 	Reserved   uint32 // 补齐到 32，保持 8 字节对齐，恒为 0
+}
+
+func newPageHeader(buf []byte) *PageHeader {
+	return &PageHeader{
+		PageType:   PageType(buf[0]),
+		Flags:      uint8(buf[1]),
+		SlotCount:  binary.LittleEndian.Uint16(buf[2:4]),
+		FreeEnd:    binary.LittleEndian.Uint16(buf[4:6]),
+		FressSpace: binary.LittleEndian.Uint16(buf[6:8]),
+		NextPageId: PageID(binary.LittleEndian.Uint32(buf[8:12])),
+		PageId:     PageID(binary.LittleEndian.Uint32(buf[12:16])),
+		LSN:        binary.LittleEndian.Uint64(buf[16:24]),
+		CheckSum:   binary.LittleEndian.Uint32(buf[24:28]),
+		Reserved:   binary.LittleEndian.Uint32(buf[24:32]),
+	}
 }
 
 func (h *PageHeader) Bytes() [32]byte {
@@ -368,8 +412,4 @@ func (s *Slot) chunk() []byte {
 
 func (s *Slot) end() uint16 {
 	return s.Offset + s.Length
-}
-
-func (s *Slot) sliceFrom(data []byte) []byte {
-	return data[s.Offset : s.Offset+s.Length]
 }
