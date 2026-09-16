@@ -39,25 +39,17 @@ func NewPage(id PageID, t PageType) *Page {
 	return &Page{pageHeader, id, data, false}
 }
 
-// --- 页头存取 ---
-// func (p *Page) ID() PageID {
-// 	// return PageID(binary.LittleEndian.Uint32(p.data[12:16]))
-// 	return p.PageId
-// }
-// func (p *Page) Type() PageType {
-// 	return PageType(p.data[0])
-// }
-// func (p *Page) SetType(t PageType) {
-// 	p.data[0] = byte(t)
-// }
-// func (p *Page) SlotCount() uint16 {
-// 	return binary.LittleEndian.Uint16(p.data[2:4])
-// }
+func (p *Page) SetType(t PageType) {
+	p.PageType = t
+	p.dirty = true
+}
 
-// func (p *Page) Dirty() bool {
-// 	return false
-// }
-// func (p *Page) MarkClean()
+func (p *Page) Dirty() bool {
+	return p.dirty
+}
+func (p *Page) MarkClean() {
+	p.dirty = false
+}
 
 // --- 记录操作 ---
 // InsertRecord 写入一条记录并返回其 slot 号。
@@ -78,7 +70,9 @@ func (p *Page) InsertRecord(rec []byte) (uint16, error) {
 			if recordLength+SlotSize > p.FressSpace {
 				return 0, ErrPageFull
 			}
-			p.SlotCount++
+			defer func() {
+				p.SlotCount++
+			}()
 			p.FressSpace -= SlotSize
 		} else {
 			return 0, err
@@ -91,22 +85,24 @@ func (p *Page) InsertRecord(rec []byte) (uint16, error) {
 	}
 
 	// 连续空余空间不足，压缩
-	if p.freeBlock() < recordLength {
+	if p.freeBlockSize() < recordLength {
 		p.Compact()
 	}
 
 	newSlot := Slot{
+		slotNo: slotNo,
 		Offset: p.FreeEnd - recordLength,
 		Length: recordLength,
 	}
 	// 写入slot
-	p.writeSlot(slotNo, newSlot)
+	p.writeSlot(newSlot)
 	// 写入record
 	copy(p.data[newSlot.Offset:], rec)
 	// 更新FreeEnd
 	p.FreeEnd = newSlot.Offset
 	// 更新FreeSpace
 	p.FressSpace -= recordLength
+	p.dirty = true
 	return slotNo, nil
 }
 
@@ -134,8 +130,13 @@ func (p *Page) DeleteRecord(slotNo uint16) error {
 	if s.isDeleted() {
 		return ErrSlotDeleted
 	}
-	p.writeSlot(slotNo, Slot{Offset: 0, Length: 0})
+	p.writeSlot(Slot{slotNo: slotNo, Offset: 0, Length: 0})
+	if slotNo == p.SlotCount-1 {
+		p.FreeEnd += s.Length
+	}
+	p.cleanTailSlotTombs()
 	p.FressSpace += s.Length
+	p.dirty = true
 	return nil
 }
 
@@ -155,7 +156,6 @@ func (p *Page) UpdateRecord(slotNo uint16, rec []byte) (uint16, error) {
 
 	if orignalSlot.Length == newRecordLength { // 更新长度与原长度相等
 		copy(p.data[orignalSlot.Offset:], rec)
-		return slotNo, nil
 	} else if newRecordLength < orignalSlot.Length { // 更新长度变小
 		// 新record写入
 		copy(p.data[orignalSlot.Offset:], rec)
@@ -166,7 +166,6 @@ func (p *Page) UpdateRecord(slotNo uint16, rec []byte) (uint16, error) {
 		// 空间碎片
 		forwardOffset := orignalSlot.Length - newRecordLength
 		p.FressSpace += forwardOffset
-		return slotNo, nil
 	} else { // 更新长度变大
 		// 增量大于空闲空间
 		if newRecordLength-orignalSlot.Length > p.FressSpace {
@@ -175,23 +174,25 @@ func (p *Page) UpdateRecord(slotNo uint16, rec []byte) (uint16, error) {
 		// 删除原有记录
 		p.DeleteRecord(slotNo)
 		// 连续空余空间不足，压缩
-		if p.freeBlock() < newRecordLength {
+		if p.freeBlockSize() < newRecordLength {
 			p.Compact()
 		}
 		newSlot := Slot{
+			slotNo: slotNo,
 			Offset: p.FreeEnd - newRecordLength,
 			Length: newRecordLength,
 		}
 		// 写入slot
-		p.writeSlot(slotNo, newSlot)
+		p.writeSlot(newSlot)
 		// 写入record
 		copy(p.data[newSlot.Offset:], rec)
 		// 更新FreeEnd
 		p.FreeEnd = newSlot.Offset
 		// 更新FreeSpace
 		p.FressSpace -= newRecordLength
-		return slotNo, nil
 	}
+	p.dirty = true
+	return slotNo, nil
 }
 
 // Compact 碎片整理：把所有存活记录压到页尾，重建 slot 目录。
@@ -199,21 +200,6 @@ func (p *Page) UpdateRecord(slotNo uint16, rec []byte) (uint16, error) {
 func (p *Page) Compact() {
 	// 从后向前清理slot墓碑
 	if p.SlotCount == 0 {
-		return
-	}
-	for i := p.SlotCount - 1; ; i-- {
-		if p.getSlot(i).isDeleted() {
-			p.SlotCount--
-		} else {
-			break
-		}
-		if i == 0 {
-			break
-		}
-	}
-	if p.SlotCount == 0 {
-		p.FreeEnd = PageSize
-		p.FressSpace = PageSize - PageHeaderSize
 		return
 	}
 	// 清理碎片
@@ -264,9 +250,10 @@ func (p *Page) Compact() {
 		copy(p.data[fromStart+currRecord.runningOffset:], p.data[fromStart:fromEnd])
 	}
 	for _, s := range slots {
-		p.writeSlot(s.slotNo, s)
+		p.writeSlot(s)
 	}
 	p.FreeEnd += runningOffset
+	p.dirty = true
 }
 
 // Iterate 顺序遍历所有存活记录；fn 返回 false 时提前结束。
@@ -291,29 +278,30 @@ func (p *Page) Bytes() []byte {
 }
 
 func DecodePage(id PageID, buf []byte) (*Page, error) {
-	// TODO
-	return nil, nil
+	if len(buf) != PageSize {
+		return nil, ErrNotPage
+	}
+	page := &Page{
+		PageHeader: *newPageHeader(buf[:32]),
+		data:       [4096]byte(buf),
+		dirty:      false,
+	}
+	if page.PageType < PageTypeData || page.PageType > PageTypeIndex {
+		return nil, ErrBadPageType
+	}
+	return page, nil
 }
 func (p *Page) getSlot(slotNo uint16) *Slot {
 	slotStart := PageHeaderSize + slotNo*SlotSize
 	slotBytes := p.data[slotStart : slotStart+SlotSize]
-	s := NewSlot([4]byte(slotBytes))
+	s := newSlot([4]byte(slotBytes))
 	s.slotNo = slotNo
 	return s
 }
 
 // 向指定slot写入信息
-func (p *Page) writeSlot(slotNo uint16, slot Slot) {
-	copy(p.data[PageHeaderSize+slotNo*SlotSize:], slot.chunk())
-}
-
-// 追加slot
-func (p *Page) appendSlot(s Slot) uint16 {
-	slotNo := p.SlotCount
-	p.writeSlot(slotNo, s)
-	p.SlotCount++
-	p.FressSpace -= SlotSize
-	return slotNo
+func (p *Page) writeSlot(s Slot) {
+	copy(p.data[PageHeaderSize+s.slotNo*SlotSize:], s.chunk())
 }
 
 // 遍历查找slot墓碑，返回slotNo
@@ -330,8 +318,28 @@ func (p *Page) sliceBySlot(s *Slot) []byte {
 	return p.data[s.Offset : s.Offset+s.Length]
 }
 
-func (p *Page) freeBlock() uint16 {
+func (p *Page) freeBlockSize() uint16 {
 	return p.FreeEnd - p.SlotCount*SlotSize - PageHeaderSize
+}
+
+func (p *Page) cleanTailSlotTombs() {
+	for i := p.SlotCount - 1; ; i-- {
+		if p.getSlot(i).isDeleted() {
+			p.SlotCount--
+			p.FressSpace += SlotSize
+		} else {
+			break
+		}
+		if i == 0 {
+			break
+		}
+	}
+	if p.SlotCount == 0 {
+		p.FreeEnd = PageSize
+		p.FressSpace = PageSize - PageHeaderSize
+		p.dirty = true
+		return
+	}
 }
 
 // 32 bytes
@@ -359,7 +367,7 @@ func newPageHeader(buf []byte) *PageHeader {
 		PageId:     PageID(binary.LittleEndian.Uint32(buf[12:16])),
 		LSN:        binary.LittleEndian.Uint64(buf[16:24]),
 		CheckSum:   binary.LittleEndian.Uint32(buf[24:28]),
-		Reserved:   binary.LittleEndian.Uint32(buf[24:32]),
+		Reserved:   binary.LittleEndian.Uint32(buf[28:32]),
 	}
 }
 
@@ -392,7 +400,7 @@ type Slot struct {
 	Length uint16 // 记录字节数
 }
 
-func NewSlot(bytes [4]byte) *Slot {
+func newSlot(bytes [4]byte) *Slot {
 	return &Slot{
 		Offset: binary.LittleEndian.Uint16(bytes[0:2]),
 		Length: binary.LittleEndian.Uint16(bytes[2:4]),

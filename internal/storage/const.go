@@ -17,6 +17,8 @@ var (
 	ErrRecordTooBig = errors.New("storage: record exceeds MaxRecordSize")
 	ErrBadMagic     = errors.New("storage: not an easy-db file")
 	ErrBadVersion   = errors.New("storage: unsupported format version")
+	ErrNotPage      = errors.New("storage: not a complete page")
+	ErrBadPageType  = errors.New("storage: Unrecognized page type")
 )
 
 type PageType uint8
